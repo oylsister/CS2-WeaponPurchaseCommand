@@ -163,6 +163,37 @@ namespace WeaponPurchaseCommand
                 client.PrintToChat($"{ChatColors.Green}[Weapon]{ChatColors.Default} You have purchase {ChatColors.Lime}{weapon}{ChatColors.Default}.");
             }
 
+            List<string> weaponEntitySlot = new List<string>();
+            var weaponSlot = weaponConfig.WeaponSlot;
+
+            foreach (string keyVar in PurchaseConfig!.WeaponConfigs.Keys)
+            {
+                var slots = PurchaseConfig.WeaponConfigs[keyVar].WeaponSlot;
+
+                if(weaponSlot == slots)
+                {
+                    weaponEntitySlot.Add(PurchaseConfig.WeaponConfigs[keyVar].WeaponEntity!);
+                }
+            }
+
+            foreach (var clientWeapon in client.PlayerPawn.Value.WeaponServices!.MyWeapons)
+            {
+                bool found = false;
+
+                if (found)
+                    break;
+
+                foreach (var weaponEntitnyName in weaponEntitySlot)
+                {
+                    if (String.Equals(clientWeapon.Value.DesignerName, weaponEntitnyName))
+                    {
+                        clientWeapon.Value.Remove();
+                        found = true;
+                        break;
+                    }
+                }
+            }
+
             client.GiveNamedItem(weaponConfig.WeaponEntity!);
             client.InGameMoneyServices!.Account = clientMoney - weaponConfig.PurchasePrice;
             PlayerBuyList[client].IsCooldownNow = true;
@@ -186,6 +217,7 @@ public class ConfigFile
 
 public class PurchaseSetting
 {
+    [JsonPropertyName("cooldown")]
     public float CooldownPurchase { get; set; } = 0f;
 }
 
@@ -197,10 +229,11 @@ public class PurchaseHistory
 
 public class WeaponConfig
 {
-    public WeaponConfig(List<string> purchaseCommand, string weaponEntity, int price, int limitbuy, bool restrict)
+    public WeaponConfig(List<string> purchaseCommand, string weaponEntity, int slot, int price, int limitbuy, bool restrict)
     {
         PurchaseCommand = purchaseCommand;
         WeaponEntity = weaponEntity;
+        WeaponSlot = slot;
         PurchasePrice = price;
         PurchaseLimit = limitbuy;
         PurchaseRestrict = restrict;
@@ -211,6 +244,9 @@ public class WeaponConfig
 
     [JsonPropertyName("weaponentity")]
     public string? WeaponEntity { get; set; }
+
+    [JsonPropertyName("weaponslot")]
+    public int WeaponSlot { get; set; }
 
     [JsonPropertyName("price")]
     public int PurchasePrice { get; set; }
