@@ -1,0 +1,23 @@
+{
+    "Settings":{
+        "cooldown": 0.0
+    },
+    "Weapons":{
+        "Glock":{
+            "command": ["css_glock"],
+            "weaponentity": "weapon_glock",
+            "weaponslot": 1,
+            "price": 200,
+            "maxpurchase": 0,
+            "restrict": false
+        },
+        "M4A1-S":{
+            "command": ["css_m4a1s", "css_m4a1"],
+            "weaponentity": "weapon_m4a1_silencer",
+            "weaponslot": 0,
+            "price": 3100,
+            "maxpurchase": 0,
+            "restrict": false
+        }
+    }
+}
