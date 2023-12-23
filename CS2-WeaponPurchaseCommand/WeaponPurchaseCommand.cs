@@ -1,4 +1,4 @@
-﻿using System.Text.Json;
+using System.Text.Json;
 using System.Text.Json.Serialization;
 using CounterStrikeSharp.API.Core;
 using CounterStrikeSharp.API.Core.Attributes.Registration;
@@ -45,7 +45,8 @@ namespace WeaponPurchaseCommand
         public HookResult OnPlayerDisconnect(EventPlayerDisconnect @event, GameEventInfo info)
         {
             var client = @event.Userid;
-            PlayerBuyList[client].PlayerBuyHistory.Clear();
+            if (PlayerBuyList.TryGetValue(client, out var value))
+                value.PlayerBuyHistory.Clear();
             PlayerBuyList.Remove(client);
             return HookResult.Continue;
         }
@@ -54,7 +55,8 @@ namespace WeaponPurchaseCommand
         public HookResult OnPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
         {
             var client = @event.Userid;
-            PlayerBuyList[client].PlayerBuyHistory.Clear();
+            if (PlayerBuyList.TryGetValue(client, out var value))
+                value.PlayerBuyHistory.Clear();
             return HookResult.Continue;
         }
 
