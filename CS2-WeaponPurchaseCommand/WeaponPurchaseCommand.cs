@@ -1,309 +1,517 @@
 ﻿using CounterStrikeSharp.API;
 using CounterStrikeSharp.API.Core;
-using CounterStrikeSharp.API.Core.Attributes.Registration;
+using CounterStrikeSharp.API.Modules.Admin;
 using CounterStrikeSharp.API.Modules.Commands;
+using CounterStrikeSharp.API.Modules.Cvars;
+using CounterStrikeSharp.API.Modules.Memory;
 using CounterStrikeSharp.API.Modules.Memory.DynamicFunctions;
+using CounterStrikeSharp.API.Modules.Menu;
+using CounterStrikeSharp.API.Modules.Timers;
 using CounterStrikeSharp.API.Modules.Utils;
 using Microsoft.Extensions.Logging;
 using Newtonsoft.Json;
+using static CounterStrikeSharp.API.Core.Listeners;
 
-namespace WeaponPurchaseCommand
+namespace CS2_WeaponPurchaseCommand;
+
+public class WeaponsPurchase(ILogger<WeaponsPurchase> logger) : BasePlugin
 {
-    public class WeaponPurchaseCommand : BasePlugin
+    public override string ModuleName => "CS2-WeaponPurchaseCommand";
+    public override string ModuleDescription => "A plugin to purchase weapons in CS2 Zombie Escape";
+    public override string ModuleAuthor => "Oylsister";
+    public override string ModuleVersion => "2.0";
+
+    private readonly ILogger<WeaponsPurchase> _logger = logger;
+    public static Dictionary<string, WeaponAttribute>? WeaponsConfig = null;
+    bool weaponCommandInitialized = false;
+    public string ConfigPath = Path.Combine(Application.RootDirectory, "configs/zombiesharp/");
+    public FakeConVar<string> WeaponConfigPath = new("css_weapon_config_path", "Weapon Config Path", "weapons.jsonc", ConVarFlags.FCVAR_NONE);
+    public Dictionary<CCSPlayerController, PurchaseCount>? PlayerPurchaseCount { get; set; } = [];
+
+    public override void Load(bool hotReload)
     {
-        public override string ModuleName => "CS2-Weapon Purchase Command";
-        public override string ModuleVersion => "1.2";
-        public override string ModuleAuthor => "Oylsister";
-        public override string ModuleDescription => "Purchase weapon command for counter-strike 2";
+        AddCommand("zs_restrict", "Restrict Weapon Command", WeaponRestrictCommand);
+        AddCommand("zs_unrestrict", "Unrestrict Weapon Command", WeaponUnrestrictCommand);
 
-        public ConfigFile? PurchaseConfig { get; private set; }
+        RegisterListener<OnClientPutInServer>(OnClientPutInServer);
+        RegisterListener<OnClientDisconnect>(OnClientDisconnect);
+        RegisterListener<OnMapStart>(OnMapStart);
 
-        public bool ConfigIsLoaded { get; set; } = false;
-        public bool CommandAssigned { get; set; } = false;
+        VirtualFunctions.CCSPlayer_ItemServices_CanAcquireFunc.Hook(OnCanAcquire, HookMode.Pre);
+    }
 
-        public Dictionary<int, PurchaseHistory> PlayerBuyList { get; set; } = new();
+    public override void Unload(bool hotReload)
+    {
+        RemoveListener<OnClientPutInServer>(OnClientPutInServer);
+        RemoveListener<OnClientDisconnect>(OnClientDisconnect);
+        RemoveListener<OnMapStart>(OnMapStart);
 
-        public override void Load(bool hotReload)
+        VirtualFunctions.CCSPlayer_ItemServices_CanAcquireFunc.Unhook(OnCanAcquire, HookMode.Pre);
+    }
+
+    public void OnClientPutInServer(int playerSlot)
+    {
+        var client = Utilities.GetPlayerFromSlot(playerSlot);
+
+        if (client == null || !client.IsValid)
+            return;
+
+        // we need to make sure this is not null.
+        if (PlayerPurchaseCount == null)
+            PlayerPurchaseCount = [];
+
+        // if player purchase count is not in the dictionary, add it.
+        if (!PlayerPurchaseCount.ContainsKey(client))
+            PlayerPurchaseCount.Add(client, new PurchaseCount());
+    }
+
+    public void OnClientDisconnect(int playerSlot)
+    {
+        var client = Utilities.GetPlayerFromSlot(playerSlot);
+
+        if (client == null || !client.IsValid)
+            return;
+
+        PlayerPurchaseCount?.Remove(client);
+    }
+
+    public void OnMapStart(string mapName)
+    {
+        PlayerPurchaseCount?.Clear();
+        WeaponsConfig?.Clear();
+
+        // make sure this one is null.
+        WeaponsConfig = null;
+
+        // initial weapon config data
+        WeaponsConfig = new Dictionary<string, WeaponAttribute>();
+        var configPath = Path.Combine(ConfigPath, WeaponConfigPath.Value ?? "weapons.jsonc");
+
+        if (!File.Exists(configPath))
         {
-            AddCommand("css_weaponlist", "Command Check Weapon list", CheckWeaponListCommand);
-            RegisterListener<Listeners.OnMapStart>(OnMapStart);
-            RegisterListener<Listeners.OnClientPutInServer>(OnClientPutInServer);
-            RegisterListener<Listeners.OnClientDisconnect>(OnClientDisconnect);
+            _logger.LogCritical("[WeaponsOnMapStart] Couldn't find a {path} file!", configPath);
+            return;
         }
 
-        public void OnMapStart(string mapname)
-        {
-            var configPath = Path.Combine(ModuleDirectory, "weapons.json");
+        _logger.LogInformation("[WeaponsOnMapStart] Load Weapon Config file {path}.", configPath);
 
-            if (!File.Exists(configPath))
-            {
-                Logger.LogError("There is no config");
-                ConfigIsLoaded = false;
-                return;
-            }
+        // we get data from jsonc file.
+        WeaponsConfig = JsonConvert.DeserializeObject<Dictionary<string, WeaponAttribute>>(File.ReadAllText(configPath));
 
-            PurchaseConfig = JsonConvert.DeserializeObject<ConfigFile>(File.ReadAllText(configPath));
-            Logger.LogInformation("Weapon Config is loaded");
-            ConfigIsLoaded = true;
+        // we create weapon purchase command here.
+        IntialWeaponPurchaseCommand();
+    }
 
-            InitialCommand();
+    public HookResult OnCanAcquire(DynamicHook hook)
+    {
+        var itemService = hook.GetParam<CCSPlayer_ItemServices>(0);
+        var weapon = VirtualFunctions.GetCSWeaponDataFromKey(-1, hook.GetParam<CEconItemView>(1).ItemDefinitionIndex.ToString());
+        var method = hook.GetParam<AcquireMethod>(2);
+        var client = itemService.Pawn.Value.Controller.Value?.As<CCSPlayerController>();
 
-            MemoryFunctionWithReturn<CCSPlayer_WeaponServices, CBasePlayerWeapon, bool> CCSPlayer_WeaponServices_CanUseFunc = new(GameData.GetSignature("CCSPlayer_WeaponServices_CanUse"));
-            CCSPlayer_WeaponServices_CanUseFunc.Hook(OnWeaponCanUse, HookMode.Pre);
-        }
-
-        public void OnClientPutInServer(int playerSlot)
-        {
-            var client = Utilities.GetPlayerFromSlot(playerSlot);
-
-            PlayerBuyList.Add(client.Slot, new PurchaseHistory());
-        }
-
-        public void OnClientDisconnect(int playerSlot)
-        {
-            var client = Utilities.GetPlayerFromSlot(playerSlot);
-
-            PlayerBuyList.Remove(client.Slot);
-        }
-
-        [GameEventHandler]
-        public HookResult OnPlayerSpawn(EventPlayerSpawn @event, GameEventInfo info)
-        {
-            var client = @event.Userid;
-
-            if (PlayerBuyList.ContainsKey(client.Slot))
-                PlayerBuyList[client.Slot].PlayerBuyHistory.Clear();
-
+        if(client == null)
             return HookResult.Continue;
+
+        if (client.Team == CsTeam.Terrorist && method == AcquireMethod.Buy)
+        {
+            client.PrintToChat($" {Localizer["Prefix"]} You can't purchase as Zombie.");
+            hook.SetReturn(AcquireResult.NotAllowedByProhibition);
+            return HookResult.Handled;
         }
 
-        public void CheckWeaponListCommand(CCSPlayerController? client, CommandInfo info)
+        // if player buy from menu tell them they can't.
+        if (IsRestricted(weapon.Name))
         {
-            if (client == null)
-            {
-                return;
-            }
+            var attribute = GetWeaponAttributeByEntityName(weapon.Name);
 
-            foreach (string KeyValue in PurchaseConfig!.WeaponConfigs.Keys)
-            {
-                client.PrintToChat($"Key: {KeyValue}");
+            if (method == AcquireMethod.Buy)
+                client.PrintToChat($" {Localizer["Prefix"]} {Localizer["Weapon.IsRestricted", attribute?.WeaponName!]}");
 
-                string commandlist = "";
-
-                foreach (string commandValue in PurchaseConfig.WeaponConfigs[KeyValue].PurchaseCommand)
-                {
-                    commandlist += commandValue + ",";
-                }
-                client.PrintToChat($"Command: {commandlist}");
-            }
+            hook.SetReturn(AcquireResult.NotAllowedByProhibition);
+            return HookResult.Handled;
         }
 
-        private void InitialCommand()
+        else
         {
-            if (CommandAssigned)
+            if (method == AcquireMethod.Buy)
             {
-                return;
-            }
+                var attribute = GetWeaponAttributeByEntityName(weapon.Name);
 
-            if (PurchaseConfig == null)
-                return;
-
-            foreach (var weapon in PurchaseConfig.WeaponConfigs)
-            {
-                foreach (var command in weapon.Value.PurchaseCommand)
+                if (attribute != null)
                 {
-                    AddCommand(command, "Buy Command", PurchaseWeaponCommand);
-                }
-            }
-
-            CommandAssigned = true;
-        }
-
-        public void PurchaseWeaponCommand(CCSPlayerController? client, CommandInfo info)
-        {
-            var weaponCommand = info.GetArg(0);
-
-            foreach (string keyVar in PurchaseConfig!.WeaponConfigs.Keys)
-            {
-                foreach (string command in PurchaseConfig.WeaponConfigs[keyVar].PurchaseCommand)
-                {
-                    if (weaponCommand == command)
-                    {
-                        // info.ReplyToCommand($"{weaponCommand} with {command}");
-                        PurchaseWeapon(client!, keyVar);
-                        break;
-                    }
+                    PurchaseWeapon(client, attribute);
+                    hook.SetReturn(AcquireResult.NotAllowedByProhibition);
+                    return HookResult.Handled;
                 }
             }
         }
 
-        public void PurchaseWeapon(CCSPlayerController client, string weapon)
+        return HookResult.Continue;
+    }
+
+    public void IntialWeaponPurchaseCommand()
+    {
+        // if this part has been done before don't do it again.
+        if (weaponCommandInitialized)
+            return;
+
+        // safety first.
+        if (WeaponsConfig == null)
         {
-            var weaponConfig = PurchaseConfig!.WeaponConfigs[weapon];
+            _logger.LogError("[IntialWeaponPurchaseCommand] Weapon Configs is null!");
+            return;
+        }
 
-            if (weaponConfig == null)
+        foreach (var weapon in WeaponsConfig.Values)
+        {
+            if (weapon.PurchaseCommand == null || weapon.PurchaseCommand.Count <= 0)
+                continue;
+
+            foreach (var command in weapon.PurchaseCommand)
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} Invalid weapon!");
+                if (string.IsNullOrEmpty(command))
+                    continue;
+
+                AddCommand(command, $"Weapon {weapon.WeaponName} Purchase Command", WeaponPurchaseCommand);
+            }
+        }
+
+        weaponCommandInitialized = true;
+    }
+
+    [RequiresPermissions("@css/slay")]
+    public void WeaponRestrictCommand(CCSPlayerController? client, CommandInfo info)
+    {
+        if (WeaponsConfig == null)
+        {
+            _logger.LogError("[WeaponRestrictCommand] WeaponsConfig is null!");
+            return;
+        }
+
+        if (info.ArgCount > 1)
+        {
+            var weaponname = info.GetArg(1);
+            var weapon = GetWeaponAttributeByName(weaponname);
+
+            if (weapon == null)
+            {
+                info.ReplyToCommand($" {Localizer["Prefix"]} {Localizer["Weapon.NotFound", weaponname]}");
                 return;
             }
 
-            if (!client.PawnIsAlive)
+            Server.PrintToChatAll($" {Localizer["Prefix"]} {Localizer["Restrict.Weapon", weapon.WeaponName!]}");
+            weapon.Restrict = true;
+            return;
+        }
+
+        if (client == null)
+            return;
+
+        var menu = new ChatMenu($" {Localizer["Prefix"]} {Localizer["Restrict.MainMenu"]}");
+
+        foreach (var weapon in WeaponsConfig)
+        {
+            menu.AddMenuOption(weapon.Value.WeaponName!, (client, option) =>
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} this feature need you to be alive!");
+                weapon.Value.Restrict = true;
+                Server.PrintToChatAll($" {Localizer["Prefix"]} {Localizer["Restrict.Weapon", weapon.Value.WeaponName!]}");
+                MenuManager.CloseActiveMenu(client);
+            },
+            weapon.Value.Restrict);
+        }
+        menu.ExitButton = true;
+        MenuManager.OpenChatMenu(client, menu);
+    }
+
+    [RequiresPermissions("@css/slay")]
+    public void WeaponUnrestrictCommand(CCSPlayerController? client, CommandInfo info)
+    {
+        if (WeaponsConfig == null)
+        {
+            _logger.LogError("[WeaponRestrictCommand] WeaponsConfig is null!");
+            return;
+        }
+
+        if (info.ArgCount > 1)
+        {
+            var weaponname = info.GetArg(1);
+            var weapon = GetWeaponAttributeByName(weaponname);
+
+            if (weapon == null)
+            {
+                info.ReplyToCommand($" {Localizer["Prefix"]} {Localizer["Weapon.NotFound"]}");
                 return;
             }
 
-            if (weaponConfig.PurchaseRestrict)
+            Server.PrintToChatAll($" {Localizer["Prefix"]} {Localizer["Unrestrict.Weapon", weapon.WeaponName!]}");
+            weapon.Restrict = false;
+            return;
+        }
+
+        if (client == null)
+            return;
+
+        var menu = new ChatMenu($" {Localizer["Prefix"]} {Localizer["Unrestrict.MainMenu"]}");
+
+        foreach (var weapon in WeaponsConfig)
+        {
+            menu.AddMenuOption(weapon.Value.WeaponName!, (client, option) =>
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} Weapon {ChatColors.Lime}{weapon}{ChatColors.Default} is restricted");
+                weapon.Value.Restrict = false;
+                Server.PrintToChatAll($" {Localizer["Prefix"]} {Localizer["Unrestrict.Weapon", weapon.Value.WeaponName!]}");
+                MenuManager.CloseActiveMenu(client);
+            },
+            !weapon.Value.Restrict);
+        }
+        menu.ExitButton = true;
+        MenuManager.OpenChatMenu(client, menu);
+    }
+
+    [CommandHelper(0, "", CommandUsage.CLIENT_ONLY)]
+    public void WeaponPurchaseCommand(CCSPlayerController? client, CommandInfo info)
+    {
+        // args 0 is basically command string.
+        var command = info.GetArg(0);
+        var weaponAttribute = WeaponsConfig?.Where(weapon => weapon.Value.PurchaseCommand!.Contains(command)).FirstOrDefault().Value;
+
+        if (weaponAttribute != null && client != null)
+            PurchaseWeapon(client, weaponAttribute);
+    }
+    
+    public void PurchaseWeapon(CCSPlayerController client, WeaponAttribute attribute)
+    {
+        // double check for possible
+        if (attribute == null || client == null)
+            return;
+
+        // if not alive.
+        if (!IsPlayerAlive(client))
+        {
+            client.PrintToChat($" {Localizer["Prefix"]} {Localizer["Core.MustBeAlive"]}");
+            return;
+        }
+
+        if (client.Team == CsTeam.Terrorist)
+        {
+            client.PrintToChat($" {Localizer["Prefix"]} You can't purchase as Zombie.");
+            return;
+        }
+
+        // if it's restricted
+        if (IsRestricted(attribute.WeaponEntity!))
+        {
+            client.PrintToChat($" {Localizer["Prefix"]} {Localizer["Weapon.IsRestricted", attribute.WeaponName!]}");
+            return;
+        }
+
+        // check their cash in account
+        if (client.InGameMoneyServices?.Account < attribute.Price)
+        {
+            client.PrintToChat($" {Localizer["Prefix"]} {Localizer["Weapon.NotEnoughCash"]}");
+            return;
+        }
+
+        // Max Purchase section, will be added later.
+        if (attribute.MaxPurchase != 0)
+        {
+            var count = 0;
+
+            if (PlayerPurchaseCount == null)
+            {
+                _logger.LogError("[PurchaseWeapon] Player Purchase count is null!");
                 return;
             }
 
-            var cooldown = PurchaseConfig!.CooldownPurchase;
-            if (cooldown > 0 && PlayerBuyList[client.Slot].IsCooldownNow)
+            if (!PlayerPurchaseCount.ContainsKey(client))
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} Your purchase is on cooldown now!");
+                _logger.LogError("[PurchaseWeapon] Player {name} is not in purchase count data, so create a new one", client.PlayerName);
+                PlayerPurchaseCount.Add(client, new());
+            }
+
+            if (PlayerPurchaseCount[client].WeaponCount == null)
+            {
+                _logger.LogError("[PurchaseWeapon] Player {name} Purchase data is null", client.PlayerName);
                 return;
             }
 
-            var clientMoney = client.InGameMoneyServices!.Account;
+            if (PlayerPurchaseCount[client].WeaponCount!.ContainsKey(attribute.WeaponEntity!))
+                count = PlayerPurchaseCount[client].WeaponCount![attribute.WeaponEntity!];
 
-            if (clientMoney < weaponConfig.PurchasePrice)
+            if (count >= attribute.MaxPurchase)
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} You don't have enough money to purchase this weapon!");
+                client.PrintToChat($" {Localizer["Prefix"]} {Localizer["Weapon.ReachMaxPurchase", attribute.MaxPurchase]}");
                 return;
             }
+        }
 
-            int weaponPurchased;
-            bool weaponFound = PlayerBuyList[client.Slot].PlayerBuyHistory.TryGetValue(weapon, out weaponPurchased);
+        // we need to force drop weapon first before make an purchase
+        var weapons = client.PlayerPawn.Value?.WeaponServices?.MyWeapons;
 
-            if (weaponConfig.PurchaseLimit > 0)
+        if (weapons == null)
+        {
+            _logger.LogError("[PurchaseWeapon] {0} Weapon service is somehow null", client.PlayerName);
+            return;
+        }
+
+        var weapondrop = string.Empty;
+
+        foreach (var weapon in weapons)
+        {
+            var slot = (int)weapon.Value!.GetVData<CCSWeaponBaseVData>()!.GearSlot;
+
+            // for primary and secondary only.
+            if (slot > 2)
+                continue;
+
+            if (slot == attribute.WeaponSlot)
             {
-                if (weaponFound)
-                {
-                    if (weaponPurchased >= weaponConfig.PurchaseLimit)
-                    {
-                        client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} You have reached maximum purchase for {ChatColors.Lime}{weapon}{ChatColors.Default}, you can purchase again in next round");
-                        return;
-                    }
-                    else
-                    {
-                        //client.PrintToChat($"{ChatColors.Lime}{weapon}{ChatColors.Default} Purchased: {weaponPurchased}");
-                        PlayerBuyList[client.Slot].PlayerBuyHistory[weapon] = weaponPurchased + 1;
-                    }
-                }
-                else
-                {
-                    PlayerBuyList[client.Slot].PlayerBuyHistory.Add(weapon, 1);
-                }
+                // drop this weapon then break
+                weapondrop = weapon.Value.DesignerName;
+                break;
+            }
+        }
 
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} You have purchase {ChatColors.Lime}{weapon}{ChatColors.Default}, Purchase Limit: {ChatColors.Green}{weaponConfig.PurchaseLimit - weaponPurchased - 1}/{weaponConfig.PurchaseLimit}");
+        Server.NextFrame(() =>
+        {
+            // we give weapon to them this part can't be null unless server manager fucked it up.
+            if (attribute.WeaponEntity == "item_kevlar")
+            {
+                client.PlayerPawn.Value!.ArmorValue = 100;
+                Utilities.SetStateChanged(client.PlayerPawn.Value, "CCSPlayerPawn", "m_ArmorValue");
             }
 
             else
             {
-                client.PrintToChat($" {ChatColors.Green}[Weapon]{ChatColors.Default} You have purchase {ChatColors.Lime}{weapon}{ChatColors.Default}.");
+                if (!string.IsNullOrEmpty(weapondrop))
+                {
+                    // we drop the weapon first.
+                    DropWeaponByDesignName(client, weapondrop);
+                }
+
+                client.GiveNamedItem(attribute.WeaponEntity!);
             }
 
-            client.ExecuteClientCommand("slot3");
-            client.ExecuteClientCommand($"slot{weaponConfig.WeaponSlot + 1}");
+            // update purchase history
+            if (PlayerPurchaseCount![client].WeaponCount!.ContainsKey(attribute.WeaponEntity!))
+                PlayerPurchaseCount![client].WeaponCount![attribute.WeaponEntity!]++;
 
-            var activeweapon = client.PlayerPawn.Value!.WeaponServices!.ActiveWeapon;
+            else
+                PlayerPurchaseCount?[client].WeaponCount?.Add(attribute.WeaponEntity!, 1);
 
-            if (activeweapon != null && activeweapon.Value!.DesignerName != "weapon_knife")
-                client.DropActiveWeapon();
+            var purchaseCount = PlayerPurchaseCount![client].WeaponCount![attribute.WeaponEntity!];
 
-            client.GiveNamedItem(weaponConfig.WeaponEntity!);
+            var message = $" {Localizer["Prefix"]} {Localizer["Weapon.PurchaseSuccess", attribute.WeaponName!]}";
 
-            client.InGameMoneyServices.Account = clientMoney - weaponConfig.PurchasePrice;
+            if (attribute.MaxPurchase > 0)
+                message += $" {Localizer["Weapon.PurchaseCount", attribute.MaxPurchase - purchaseCount, attribute.MaxPurchase]}";
+
+            client.PrintToChat($"{message}");
+
+            // updated their cash.
+            client.InGameMoneyServices!.Account -= attribute.Price;
             Utilities.SetStateChanged(client, "CCSPlayerController", "m_pInGameMoneyServices");
-
-            AddTimer(0.2f, () =>
-            {
-                client.ExecuteClientCommand($"slot{weaponConfig.WeaponSlot + 1}");
-            });
-
-            PlayerBuyList[client.Slot].IsCooldownNow = true;
-
-
-            AddTimer(cooldown, () =>
-            {
-                PlayerBuyList[client.Slot].IsCooldownNow = false;
-            });
-        }
-        private HookResult OnWeaponCanUse(DynamicHook hook)
-        {
-            var weapon = hook.GetParam<CBasePlayerWeapon>(1);
-
-            var weaponKey = GetWeaponKeyByEntityName(weapon.DesignerName);
-
-            if (IsWeaponRestricted(weaponKey))
-            {
-                hook.SetReturn(false);
-                return HookResult.Handled;
-            }
-
-            return HookResult.Continue;
-        }
-
-        public bool IsWeaponRestricted(string weaponKey)
-        {
-            if (!PurchaseConfig!.WeaponConfigs.ContainsKey(weaponKey))
-                return false;
-
-            return PurchaseConfig!.WeaponConfigs[weaponKey].PurchaseRestrict;
-        }
-
-        public string GetWeaponKeyByEntityName(string entityName)
-        {
-            foreach (string keyVar in PurchaseConfig!.WeaponConfigs.Keys)
-            {
-                if (entityName == PurchaseConfig!.WeaponConfigs[keyVar].WeaponEntity)
-                    return keyVar;
-            }
-            return "none";
-        }
+        });
     }
-}
 
-public class ConfigFile
-{
-    public float CooldownPurchase { get; set; } = 0f;
-
-    public Dictionary<string, WeaponConfig> WeaponConfigs { get; set; } = new Dictionary<string, WeaponConfig>();
-
-    public ConfigFile()
+    public static bool IsRestricted(string weaponentity)
     {
-        List<string> commandlist = new List<string> { "css_glock" };
-        WeaponConfigs = new Dictionary<string, WeaponConfig>(StringComparer.OrdinalIgnoreCase)
-        {
-            { "Glock", new WeaponConfig(commandlist, "weapon_glock", 1, 100, 0, true) },
-        };
+        if (WeaponsConfig == null)
+            return false;
+
+        var weapon = GetWeaponAttributeByEntityName(weaponentity);
+
+        if (weapon == null)
+            return false;
+
+        return weapon.Restrict;
     }
-}
 
-public class PurchaseHistory
-{
-    public Dictionary<string, int> PlayerBuyHistory { get; set; } = new Dictionary<string, int>();
-    public bool IsCooldownNow { get; set; } = false;
-}
-
-public class WeaponConfig
-{
-    public WeaponConfig(List<string> purchaseCommand, string weaponEntity, int slot, int price, int limitbuy, bool restrict)
+    public static WeaponAttribute? GetWeaponAttributeByEntityName(string? weaponentity)
     {
-        PurchaseCommand = purchaseCommand;
-        WeaponEntity = weaponEntity;
-        WeaponSlot = slot;
-        PurchasePrice = price;
-        PurchaseLimit = limitbuy;
-        PurchaseRestrict = restrict;
+        if (WeaponsConfig == null)
+            return null;
+
+        return WeaponsConfig.Where(data => data.Value.WeaponEntity == weaponentity).FirstOrDefault().Value;
     }
 
-    public List<string> PurchaseCommand { get; set; } = new List<string>();
+    public static WeaponAttribute? GetWeaponAttributeByName(string? weapon)
+    {
+        if (WeaponsConfig == null)
+            return null;
+
+        return WeaponsConfig.Where(data => string.Equals(data.Value.WeaponName, weapon, StringComparison.OrdinalIgnoreCase)).FirstOrDefault().Value;
+    }
+
+    public bool IsPlayerAlive(CCSPlayerController client)
+    {
+        if (client == null)
+            return false;
+
+        if (!client.IsValid)
+        {
+            _logger.LogError("[IsPlayerAlive] Client is invalid pointer!");
+            return false;
+        }
+
+        var clientPawn = client.PlayerPawn.Value;
+
+        if (clientPawn == null || !clientPawn.IsValid)
+            return false;
+
+        return (LifeState_t)clientPawn.LifeState == LifeState_t.LIFE_ALIVE;
+    }
+
+    public void DropWeaponByDesignName(CCSPlayerController client, string weaponName, bool remove = false)
+    {
+        if (client == null)
+            return;
+
+        var service = client.PlayerPawn.Value?.WeaponServices;
+        var matchedWeapon = client.PlayerPawn.Value?.WeaponServices?.MyWeapons.Where(x => x.Value?.DesignerName == weaponName).FirstOrDefault();
+
+        if (matchedWeapon != null && matchedWeapon.IsValid && service != null)
+        {
+            if (matchedWeapon.Value == null)
+                return;
+
+            DropWeapon(service.As<CCSPlayer_WeaponServices>(), matchedWeapon.Value);
+
+            // set timer to remove if remove is true.
+            if (remove)
+            {
+                AddTimer(1f, () =>
+                {
+                    matchedWeapon.Value?.AddEntityIOEvent("Kill", matchedWeapon.Value, null, "", 0.1f);
+                }, TimerFlags.STOP_ON_MAPCHANGE);
+            }
+        }
+    }
+    
+    public static void DropWeapon(CCSPlayer_WeaponServices services ,CBasePlayerWeapon weapon)
+    {
+        Guard.IsValidEntity(weapon);
+        VirtualFunction.CreateVoid<nint, CBasePlayerWeapon, Vector?, Vector?>(services.Handle, GameData.GetOffset("CCSPlayer_WeaponServices_DropWeapon"))(services.Handle, weapon, null, null);
+    }
+}
+
+public class WeaponAttribute
+{
+    public string? WeaponName { get; set; }
     public string? WeaponEntity { get; set; }
+    public float Knockback { get; set; } = 1f;
     public int WeaponSlot { get; set; }
-    public int PurchasePrice { get; set; }
-    public int PurchaseLimit { get; set; } = 0;
-    public bool PurchaseRestrict { get; set; }
+    public int Price { get; set; }
+    public int MaxPurchase { get; set; } = 0;
+    public bool Restrict { get; set; } = false;
+    public List<string>? PurchaseCommand { get; set; } = [];
+}
+
+public class PurchaseCount
+{
+    public PurchaseCount()
+    {
+        WeaponCount = new Dictionary<string, int>();
+    }
+
+    public Dictionary<string, int>? WeaponCount { get; set; } = [];
 }
